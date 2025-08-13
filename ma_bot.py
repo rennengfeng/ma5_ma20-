@@ -2,6 +2,8 @@ import asyncio
 import json
 import os
 import aiohttp
+import time
+from datetime import datetime
 from telegram import (
     ReplyKeyboardMarkup,
     InlineKeyboardMarkup,
@@ -20,7 +22,12 @@ from config import TOKEN, CHAT_ID
 
 DATA_FILE = "symbols.json"
 
-# 主菜单（保留数字前缀）
+# K线参数配置
+INTERVAL = "15m"      # 15分钟K线
+MA5_PERIOD = 9        # 改为MA9
+MA20_PERIOD = 26      # 改为MA26
+
+# 主菜单
 main_menu = [
     ["1. 添加币种", "2. 删除币种"],
     ["3. 开启监控", "4. 停止监控"],
@@ -56,109 +63,104 @@ def save_data(data):
 data = load_data()
 monitoring_task = None
 user_states = {}
+prev_klines = {}  # 缓存各币种上一次的K线数据
 
-# --- 精确MA计算逻辑 ---
+# --- MA计算函数 ---
 async def get_klines(symbol, market_type):
-    interval = "15m"
-    limit = 20
+    limit = max(MA5_PERIOD, MA20_PERIOD) + 5  # 多取几根防止边界问题
     if market_type == "contract":
-        url = f"https://fapi.binance.com/fapi/v1/klines?symbol={symbol.upper()}&interval={interval}&limit={limit}"
+        url = f"https://fapi.binance.com/fapi/v1/klines?symbol={symbol.upper()}&interval={INTERVAL}&limit={limit}"
     else:
-        url = f"https://api.binance.com/api/v3/klines?symbol={symbol.upper()}&interval={interval}&limit={limit}"
+        url = f"https://api.binance.com/api/v3/klines?symbol={symbol.upper()}&interval={INTERVAL}&limit={limit}"
     
     async with aiohttp.ClientSession() as session:
         async with session.get(url) as resp:
             if resp.status == 200:
-                return await resp.json()
+                klines = await resp.json()
+                print(f"{symbol} 最新K线时间: {datetime.fromtimestamp(klines[-1][0]/1000)}")
+                return klines
             return None
 
 def calculate_ma(klines):
-    closes = [float(k[4]) for k in klines]
-    ma5 = sum(closes[-5:]) / 5
-    ma20 = sum(closes[-20:]) / 20
+    closes = [float(k[4]) for k in klines]  # 收盘价列表
+    ma9 = sum(closes[-MA5_PERIOD:]) / MA5_PERIOD
+    ma26 = sum(closes[-MA20_PERIOD:]) / MA20_PERIOD
     current_price = closes[-1]
-    return ma5, ma20, current_price
+    return ma9, ma26, current_price
 
-# --- 监控任务（核心修改部分）---
+# --- 监控任务（方案二实现）---
 async def monitor_task(app):
-    ma_history = {}  # 存储各币种历史MA值: {symbol_type: {'ma5': [], 'ma20': []}}
+    prev_states = {}  # 保存各币种上次的MA值
     
     while data["monitor"]:
-        current_ma_values = {}
-        
-        # 第一步：获取所有币种最新MA值
         for item in data["symbols"]:
             symbol_key = f"{item['symbol']}_{item['type']}"
             try:
+                # 获取最新K线数据
                 klines = await get_klines(item["symbol"], item["type"])
-                if klines and len(klines) >= 20:  # 确保有足够数据
-                    ma5, ma20, price = calculate_ma(klines)
-                    current_ma_values[symbol_key] = {
-                        'ma5': ma5,
-                        'ma20': ma20,
-                        'price': price
-                    }
+                if not klines or len(klines) < MA20_PERIOD:
+                    continue
+                
+                # 检查是否是新K线（对比开盘时间）
+                if symbol_key in prev_klines:
+                    last_kline_time = prev_klines[symbol_key][-1][0]
+                    if klines[-1][0] == last_kline_time:
+                        continue  # K线未更新，跳过计算
+                
+                # K线更新，计算MA值
+                ma9, ma26, price = calculate_ma(klines)
+                prev_klines[symbol_key] = klines  # 更新缓存
+                
+                # 信号检测（需有历史数据）
+                if symbol_key in prev_states:
+                    prev_ma9, prev_ma26 = prev_states[symbol_key]
                     
-                    # 初始化历史记录
-                    if symbol_key not in ma_history:
-                        ma_history[symbol_key] = {'ma5': [], 'ma20': []}
+                    # 上穿：MA9从下方穿过MA26
+                    if prev_ma9 <= prev_ma26 and ma9 > ma26:
+                        signal = (
+                            f"📈 买入信号 {item['symbol']} ({item['type']})\n"
+                            f"价格: {price:.4f}\n"
+                            f"MA9: {ma9:.4f} (前值 {prev_ma9:.4f})\n"
+                            f"MA26: {ma26:.4f} (前值 {prev_ma26:.4f})"
+                        )
+                        for uid in user_states.keys():
+                            await app.bot.send_message(chat_id=uid, text=signal)
                     
-                    # 保留最近3个值用于确认趋势
-                    ma_history[symbol_key]['ma5'].append(ma5)
-                    ma_history[symbol_key]['ma20'].append(ma20)
-                    if len(ma_history[symbol_key]['ma5']) > 3:
-                        ma_history[symbol_key]['ma5'].pop(0)
-                        ma_history[symbol_key]['ma20'].pop(0)
+                    # 下穿：MA9从上方穿过MA26
+                    elif prev_ma9 >= prev_ma26 and ma9 < ma26:
+                        signal = (
+                            f"📉 卖出信号 {item['symbol']} ({item['type']})\n"
+                            f"价格: {price:.4f}\n"
+                            f"MA9: {ma9:.4f} (前值 {prev_ma9:.4f})\n"
+                            f"MA26: {ma26:.4f} (前值 {prev_ma26:.4f})"
+                        )
+                        for uid in user_states.keys():
+                            await app.bot.send_message(chat_id=uid, text=signal)
+                
+                # 保存当前MA值
+                prev_states[symbol_key] = (ma9, ma26)
                 
             except Exception as e:
-                print(f"获取 {item['symbol']} 数据出错: {e}")
-                continue
+                print(f"监控 {item['symbol']} 出错: {e}")
         
-        # 第二步：检测交叉信号
-        for symbol_key, values in current_ma_values.items():
-            if symbol_key not in ma_history or len(ma_history[symbol_key]['ma5']) < 2:
-                continue
-                
-            # 获取当前和前值
-            prev_ma5 = ma_history[symbol_key]['ma5'][-2]
-            prev_ma20 = ma_history[symbol_key]['ma20'][-2]
-            curr_ma5 = values['ma5']
-            curr_ma20 = values['ma20']
-            price = values['price']
-            
-            # 上穿检测（金叉）
-            if prev_ma5 <= prev_ma20 and curr_ma5 > curr_ma20:
-                signal = (
-                    f"📈 买入信号 {symbol_key.replace('_', ' ')}\n"
-                    f"价格: {price:.4f}\n"
-                    f"MA5: {curr_ma5:.4f} (前值 {prev_ma5:.4f})\n"
-                    f"MA20: {curr_ma20:.4f} (前值 {prev_ma20:.4f})"
-                )
-                # 发送给所有活跃用户
-                for uid in user_states.keys():
-                    try:
-                        await app.bot.send_message(chat_id=uid, text=signal)
-                    except Exception as e:
-                        print(f"发送消息给 {uid} 失败: {e}")
-            
-            # 下穿检测（死叉）
-            elif prev_ma5 >= prev_ma20 and curr_ma5 < curr_ma20:
-                signal = (
-                    f"📉 卖出信号 {symbol_key.replace('_', ' ')}\n"
-                    f"价格: {price:.4f}\n"
-                    f"MA5: {curr_ma5:.4f} (前值 {prev_ma5:.4f})\n"
-                    f"MA20: {curr_ma20:.4f} (前值 {prev_ma20:.4f})"
-                )
-                for uid in user_states.keys():
-                    try:
-                        await app.bot.send_message(chat_id=uid, text=signal)
-                    except Exception as e:
-                        print(f"发送消息给 {uid} 失败: {e}")
-        
-        # 严格每分钟执行一次
+        # 每分钟检查一次（实际计算仅在K线更新时触发）
         await asyncio.sleep(60)
 
-# --- 以下保持原有代码不变 ---
+# --- 删除后刷新列表 ---
+async def refresh_delete_list(update, user_id):
+    if not data["symbols"]:
+        await update.message.reply_text("已无更多币种可删除", reply_markup=reply_markup)
+        user_states[user_id] = {}
+        return
+    
+    msg = "请选择要删除的币种：\n"
+    for idx, s in enumerate(data["symbols"], 1):
+        msg += f"{idx}. {s['symbol']} ({s['type']})\n"
+    
+    user_states[user_id] = {"step": "delete_symbol"}
+    await update.message.reply_text(msg + "\n请输入编号继续删除，或输入0返回", reply_markup=reply_markup)
+
+# --- 按钮回调 ---
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -206,8 +208,12 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             msg = "监控已开启\n当前监控列表：\n"
             for s in data["symbols"]:
                 try:
-                    _, _, price = calculate_ma(await get_klines(s["symbol"], s["type"]))
-                    msg += f"{s['symbol']} ({s['type']}): {price}\n"
+                    klines = await get_klines(s["symbol"], s["type"])
+                    if klines:
+                        _, _, price = calculate_ma(klines)
+                        msg += f"{s['symbol']} ({s['type']}): {price}\n"
+                    else:
+                        msg += f"{s['symbol']} ({s['type']}): 获取数据失败\n"
                 except:
                     msg += f"{s['symbol']} ({s['type']}): 获取价格失败\n"
             
@@ -215,23 +221,12 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await query.message.reply_text("您可以在菜单中手动开启监控", reply_markup=reply_markup)
 
-async def refresh_delete_list(update, user_id):
-    if not data["symbols"]:
-        await update.message.reply_text("已无更多币种可删除", reply_markup=reply_markup)
-        user_states[user_id] = {}
-        return
-    
-    msg = "请选择要删除的币种：\n"
-    for idx, s in enumerate(data["symbols"], 1):
-        msg += f"{idx}. {s['symbol']} ({s['type']})\n"
-    
-    user_states[user_id] = {"step": "delete_symbol"}
-    await update.message.reply_text(msg + "\n请输入编号继续删除，或输入0返回", reply_markup=reply_markup)
-
+# --- 启动命令 ---
 async def start(update, context):
     user_states[update.effective_chat.id] = {}
     await update.message.reply_text("欢迎使用 MA 监控机器人", reply_markup=reply_markup)
 
+# --- 消息处理 ---
 async def handle_message(update, context):
     user_id = update.effective_chat.id
     text = update.message.text.strip()
@@ -336,10 +331,12 @@ async def handle_message(update, context):
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
 
-app = ApplicationBuilder().token(TOKEN).build()
-app.add_handler(CommandHandler("start", start))
-app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-app.add_handler(CallbackQueryHandler(button_callback))
+# --- 主程序 ---
+if __name__ == "__main__":
+    app = ApplicationBuilder().token(TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(CallbackQueryHandler(button_callback))
 
-print("机器人已启动")
-app.run_polling()
+    print("机器人已启动（MA9/MA26监控）")
+    app.run_polling()
